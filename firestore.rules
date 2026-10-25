@@ -1,0 +1,119 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for secure user isolation and validation
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isTimestamp(val) {
+      return val is timestamp || val is string;
+    }
+
+    // Match user root document
+    match /users/{userId} {
+      allow read, write: if isOwner(userId);
+
+      // Trusted Contacts subcollection
+      match /trustedContacts/{contactId} {
+        allow read: if isOwner(userId);
+        
+        allow create: if isOwner(userId)
+          && request.resource.data.name is string
+          && request.resource.data.name.size() >= 2
+          && request.resource.data.phone is string
+          && request.resource.data.phone.size() >= 7;
+
+        allow update: if isOwner(userId)
+          && request.resource.data.name is string
+          && request.resource.data.phone is string;
+
+        allow delete: if isOwner(userId);
+      }
+
+      // Incidents subcollection
+      match /incidents/{incidentId} {
+        allow read: if isOwner(userId);
+
+        allow create: if isOwner(userId)
+          && request.resource.data.userId == userId
+          && request.resource.data.status in ['active']
+          && request.resource.data.source is string;
+
+        allow update: if isOwner(userId)
+          && (
+            (resource.data.status == 'active' && request.resource.data.status in ['resolved_by_user', 'cancelled', 'active'])
+            || resource.data.status == request.resource.data.status
+          );
+
+        allow delete: if isOwner(userId);
+
+        match /alertAttempts/{attemptId} {
+          allow read: if isOwner(userId);
+          allow create: if isOwner(userId)
+            && request.resource.data.isDeliveredConfirmed == false;
+          allow update, delete: if false;
+        }
+      }
+
+      // Check-ins subcollection
+      match /checkins/{checkinId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // AI Journeys subcollection (Feature A)
+      match /journeys/{journeyId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // FCM Device Tokens subcollection
+      match /fcmTokens/{tokenId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    // Live Tracking Sessions for active SOS incidents & Journeys
+    match /trackingSessions/{incidentId} {
+      allow read: if isAuthenticated() && (
+        request.auth.uid == resource.data.ownerUid ||
+        (resource.data.authorizedUids is list && request.auth.uid in resource.data.authorizedUids) ||
+        (request.auth.token.phone_number != null && resource.data.authorizedPhones is list && request.auth.token.phone_number in resource.data.authorizedPhones)
+      );
+
+      allow create: if isAuthenticated()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.incidentId == incidentId
+        && request.resource.data.isActive == true;
+
+      allow update: if isAuthenticated()
+        && request.auth.uid == resource.data.ownerUid;
+
+      allow delete: if isAuthenticated() && request.auth.uid == resource.data.ownerUid;
+    }
+
+    // Community Safety Reports (Feature C)
+    match /communityReports/{reportId} {
+      // Readable by authenticated community users
+      allow read: if isAuthenticated();
+
+      // Writable only with author ID match
+      allow create: if isAuthenticated()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.title is string
+        && request.resource.data.locationName is string;
+
+      allow update, delete: if isAuthenticated()
+        && resource.data.userId == request.auth.uid;
+    }
+
+    // Default deny for any unmapped paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
