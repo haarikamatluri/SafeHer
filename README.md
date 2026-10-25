@@ -32,7 +32,7 @@
 8. [Automated Test Suite & Quality Assurance](#8-automated-test-suite--quality-assurance)
 9. [Security, Privacy & Ethics](#9-security-privacy--ethics)
 10. [Hackathon Demo & Evaluator Script](#10-hackathon-demo--evaluator-script)
-11. [Author & Contact](#11-author--contact)
+
 
 ---
 
