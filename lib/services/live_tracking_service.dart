@@ -9,6 +9,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/incident.dart';
 import '../models/trusted_contact.dart';
 import 'auth_service.dart';
+import 'diagnostic_logger.dart';
+import 'incident_service.dart';
 
 class LiveTrackingState {
   final bool isTrackingActive;
@@ -54,7 +56,9 @@ class LiveTrackingState {
 class LiveTrackingService {
   static final LiveTrackingService _instance = LiveTrackingService._internal();
   factory LiveTrackingService() => _instance;
-  LiveTrackingService._internal();
+  LiveTrackingService._internal() {
+    _loadPersistedOfflineQueue();
+  }
 
   StreamSubscription<Position>? _positionSubscription;
   Timer? _staleCheckTimer;
@@ -72,6 +76,22 @@ class LiveTrackingService {
   LiveTrackingState _currentState = const LiveTrackingState();
   LiveTrackingState get currentState => _currentState;
 
+  Future<void> _loadPersistedOfflineQueue() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final str = prefs.getString('safeher_tracking_offline_queue');
+      if (str != null) {
+        final list = jsonDecode(str) as List<dynamic>;
+        _offlineQueue.clear();
+        for (final item in list) {
+          if (item is Map) {
+            _offlineQueue.add(Map<String, dynamic>.from(item));
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
   /// Starts live location tracking session for an active incident
   Future<void> startTracking({
     required Incident incident,
@@ -79,25 +99,25 @@ class LiveTrackingService {
   }) async {
     // 1. Guard against duplicate stream starts
     if (_currentState.isTrackingActive && _activeIncidentId == incident.id) {
-      debugPrint(
-        '[LiveTrackingService] Session already active for ${incident.id}',
-      );
+      debugPrint('[LiveTrackingService] Session already active for ${incident.id}');
       return;
     }
 
     _activeIncidentId = incident.id;
     _breadcrumbs.clear();
-    _offlineQueue.clear();
 
     // 2. Check GPS Service
     final serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
+      DiagnosticLogger().logTrackingStarted(
+        incidentId: incident.id,
+        isServiceEnabled: false,
+      );
       _updateState(
         _currentState.copyWith(
           isTrackingActive: false,
           isServiceDisabled: true,
-          statusMessage:
-              'GPS is disabled on this device. Turn on location services.',
+          statusMessage: 'GPS is disabled on this device. Turn on location services.',
         ),
       );
       return;
@@ -124,8 +144,7 @@ class LiveTrackingService {
         _currentState.copyWith(
           isTrackingActive: false,
           isPermissionDenied: true,
-          statusMessage:
-              'Location permission permanently denied. Enable in Settings.',
+          statusMessage: 'Location permission permanently denied. Enable in Settings.',
         ),
       );
       return;
@@ -161,16 +180,21 @@ class LiveTrackingService {
       ),
     );
 
-    // 5. Initialize Firestore Tracking Session Document
-    await _initFirestoreSession(incident, authorizedContacts);
+    DiagnosticLogger().logTrackingStarted(
+      incidentId: incident.id,
+      isServiceEnabled: true,
+    );
+
+    // 5. Initialize Firestore Tracking Session Document asynchronously
+    unawaited(_initFirestoreSession(incident, authorizedContacts));
 
     // 6. Configure Location Settings (Android Foreground Service)
     LocationSettings locationSettings;
     if (defaultTargetPlatform == TargetPlatform.android && !kIsWeb) {
       locationSettings = AndroidSettings(
         accuracy: LocationAccuracy.high,
-        distanceFilter: 15, // Update after moving 15 meters
-        intervalDuration: const Duration(seconds: 15), // Or 15s interval
+        distanceFilter: 10, // Update after moving 10 meters
+        intervalDuration: const Duration(seconds: 10), // Or 10s interval
         foregroundNotificationConfig: const ForegroundNotificationConfig(
           notificationTitle: 'SafeHer SOS Active: Live Location Tracking',
           notificationText: 'Sharing real-time emergency coordinates with authorized trusted contacts.',
@@ -180,42 +204,41 @@ class LiveTrackingService {
     } else {
       locationSettings = const LocationSettings(
         accuracy: LocationAccuracy.high,
-        distanceFilter: 15,
+        distanceFilter: 10,
       );
     }
 
     // 7. Subscribe to Position Stream
     await _positionSubscription?.cancel();
-    _positionSubscription =
-        Geolocator.getPositionStream(locationSettings: locationSettings).listen(
-          (Position position) => _onPositionUpdate(position),
-          onError: (err) {
-            debugPrint('[LiveTrackingService] Location stream error: $err');
-            _updateState(
-              _currentState.copyWith(
-                isStale: true,
-                statusMessage: 'GPS signal lost or interrupted: $err',
-              ),
-            );
-          },
+    _positionSubscription = Geolocator.getPositionStream(
+      locationSettings: locationSettings,
+    ).listen(
+      (Position position) => _onPositionUpdate(position),
+      onError: (err) {
+        debugPrint('[LiveTrackingService] Location stream error: $err');
+        _updateState(
+          _currentState.copyWith(
+            isStale: true,
+            statusMessage: 'GPS signal lost or interrupted: $err',
+          ),
         );
+      },
+    );
 
-    // 8. Stale Signal Checker (flags stale if no update in 45s)
+    // 8. Stale Signal Checker (flags stale if no update in 35s)
     _staleCheckTimer?.cancel();
-    _staleCheckTimer = Timer.periodic(const Duration(seconds: 15), (timer) {
+    _staleCheckTimer = Timer.periodic(const Duration(seconds: 10), (timer) {
       if (!_currentState.isTrackingActive) {
         timer.cancel();
         return;
       }
       final lastFix = _currentState.lastFixTime;
-      if (lastFix != null &&
-          DateTime.now().difference(lastFix).inSeconds > 45) {
+      if (lastFix != null && DateTime.now().difference(lastFix).inSeconds > 35) {
         if (!_currentState.isStale) {
           _updateState(
             _currentState.copyWith(
               isStale: true,
-              statusMessage:
-                  'GPS fix delayed (>45s). Waiting for satellite signal.',
+              statusMessage: 'GPS fix delayed (>35s). Waiting for satellite signal.',
             ),
           );
         }
@@ -224,7 +247,7 @@ class LiveTrackingService {
 
     // 9. Periodic Heartbeat to sync offline queue
     _heartbeatTimer?.cancel();
-    _heartbeatTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 20), (_) {
       _flushOfflineQueue();
     });
   }
@@ -243,6 +266,7 @@ class LiveTrackingService {
       'acc': position.accuracy,
       'speed': position.speed,
       'alt': position.altitude,
+      'capturedAt': position.timestamp.toIso8601String(),
       'time': now.toIso8601String(),
     };
     _breadcrumbs.add(crumb);
@@ -267,9 +291,18 @@ class LiveTrackingService {
       ),
     );
 
-    // Throttle Firestore write (protects Spark free quota: at most 1 write per 15s)
+    // Update active incident with fresh GPS fix
+    if (_activeIncidentId != null) {
+      IncidentService().updateActiveLocation(
+        latitude: position.latitude,
+        longitude: position.longitude,
+        accuracyMeters: position.accuracy,
+      );
+    }
+
+    // Throttle Firestore write (protects Spark free quota: at most 1 write per 10s)
     final lastSync = _lastSyncTime;
-    if (lastSync == null || now.difference(lastSync).inSeconds >= 15) {
+    if (lastSync == null || now.difference(lastSync).inSeconds >= 10) {
       _syncPositionToFirestore(position, now);
     }
   }
@@ -288,6 +321,8 @@ class LiveTrackingService {
       'accuracy': position.accuracy,
       'speed': position.speed,
       'altitude': position.altitude,
+      'capturedAt': position.timestamp.toIso8601String(),
+      'syncedAt': FieldValue.serverTimestamp(),
       'updatedAt': FieldValue.serverTimestamp(),
       'updatedAtClient': timestamp.toIso8601String(),
     };
@@ -302,10 +337,19 @@ class LiveTrackingService {
       _updateState(_currentState.copyWith(lastSyncTime: _lastSyncTime));
       _flushOfflineQueue();
     } catch (e) {
-      debugPrint(
-        '[LiveTrackingService] Firestore sync failed (caching locally): $e',
-      );
-      _offlineQueue.add({'incidentId': incidentId, 'payload': updatePayload});
+      debugPrint('[LiveTrackingService] Firestore sync failed (caching locally): $e');
+      _offlineQueue.add({
+        'incidentId': incidentId,
+        'payload': {
+          'latitude': position.latitude,
+          'longitude': position.longitude,
+          'accuracy': position.accuracy,
+          'speed': position.speed,
+          'altitude': position.altitude,
+          'capturedAt': position.timestamp.toIso8601String(),
+          'updatedAtClient': timestamp.toIso8601String(),
+        },
+      });
       _persistOfflineQueue();
     }
   }
@@ -320,13 +364,15 @@ class LiveTrackingService {
     for (final item in items) {
       try {
         final id = item['incidentId'] as String;
-        final payload = item['payload'] as Map<String, dynamic>;
+        final payload = Map<String, dynamic>.from(item['payload'] as Map);
+        payload['syncedAt'] = FieldValue.serverTimestamp();
+        payload['updatedAt'] = FieldValue.serverTimestamp();
+
         await FirebaseFirestore.instance
             .collection('trackingSessions')
             .doc(id)
             .set(payload, SetOptions(merge: true));
       } catch (_) {
-        // re-queue if still offline
         _offlineQueue.add(item);
         break;
       }
@@ -378,17 +424,13 @@ class LiveTrackingService {
 
       _lastSyncTime = DateTime.now();
     } catch (e) {
-      debugPrint(
-        '[LiveTrackingService] Failed to init Firestore tracking doc: $e',
-      );
+      debugPrint('[LiveTrackingService] Failed to init Firestore tracking doc: $e');
     }
   }
 
   /// Stops tracking when user ends SOS or marks themselves safe
   Future<void> stopTracking(String incidentId) async {
-    debugPrint(
-      '[LiveTrackingService] Stopping tracking session for $incidentId',
-    );
+    debugPrint('[LiveTrackingService] Stopping tracking session for $incidentId');
 
     await _positionSubscription?.cancel();
     _positionSubscription = null;
@@ -410,9 +452,7 @@ class LiveTrackingService {
             'endedAtClient': now.toIso8601String(),
           }, SetOptions(merge: true));
     } catch (e) {
-      debugPrint(
-        '[LiveTrackingService] Failed to mark trackingSession inactive in Firestore: $e',
-      );
+      debugPrint('[LiveTrackingService] Failed to mark trackingSession inactive in Firestore: $e');
     }
 
     _updateState(
@@ -452,20 +492,20 @@ class LiveTrackingService {
 
   Future<void> startSession({
     required String label,
+    String? sessionId,
     double? destinationLat,
     double? destinationLng,
   }) async {
     final now = DateTime.now();
-    _activeIncidentId = 'journey_${now.millisecondsSinceEpoch}';
+    _activeIncidentId = sessionId ?? 'journey_${now.millisecondsSinceEpoch}';
     _breadcrumbs.clear();
-    _offlineQueue.clear();
 
     LocationSettings locationSettings;
     if (defaultTargetPlatform == TargetPlatform.android && !kIsWeb) {
       locationSettings = AndroidSettings(
         accuracy: LocationAccuracy.high,
-        distanceFilter: 15,
-        intervalDuration: const Duration(seconds: 15),
+        distanceFilter: 10,
+        intervalDuration: const Duration(seconds: 10),
         foregroundNotificationConfig: ForegroundNotificationConfig(
           notificationTitle: 'SafeHer: $label',
           notificationText: 'Journey Guardian is actively monitoring your route.',
@@ -475,7 +515,7 @@ class LiveTrackingService {
     } else {
       locationSettings = const LocationSettings(
         accuracy: LocationAccuracy.high,
-        distanceFilter: 15,
+        distanceFilter: 10,
       );
     }
 

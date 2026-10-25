@@ -18,6 +18,10 @@ class Incident {
   final int alertAttemptCount;
   final bool isSyncedToRemote;
   final Map<String, dynamic>? deliverySummary;
+  final String? locationSource; // 'fresh_gps', 'cached', 'unavailable'
+  final int? locationAgeSeconds;
+  final DateTime? locationCapturedAt;
+  final List<dynamic>? recipientResults;
 
   const Incident({
     required this.id,
@@ -35,6 +39,10 @@ class Incident {
     this.alertAttemptCount = 0,
     this.isSyncedToRemote = false,
     this.deliverySummary,
+    this.locationSource,
+    this.locationAgeSeconds,
+    this.locationCapturedAt,
+    this.recipientResults,
   });
 
   bool get isActive => status == IncidentStatus.active;
@@ -81,6 +89,10 @@ class Incident {
     int? alertAttemptCount,
     bool? isSyncedToRemote,
     Map<String, dynamic>? deliverySummary,
+    String? locationSource,
+    int? locationAgeSeconds,
+    DateTime? locationCapturedAt,
+    List<dynamic>? recipientResults,
   }) {
     return Incident(
       id: id ?? this.id,
@@ -99,6 +111,10 @@ class Incident {
       alertAttemptCount: alertAttemptCount ?? this.alertAttemptCount,
       isSyncedToRemote: isSyncedToRemote ?? this.isSyncedToRemote,
       deliverySummary: deliverySummary ?? this.deliverySummary,
+      locationSource: locationSource ?? this.locationSource,
+      locationAgeSeconds: locationAgeSeconds ?? this.locationAgeSeconds,
+      locationCapturedAt: locationCapturedAt ?? this.locationCapturedAt,
+      recipientResults: recipientResults ?? this.recipientResults,
     );
   }
 
@@ -119,6 +135,10 @@ class Incident {
       'alertAttemptCount': alertAttemptCount,
       'isSyncedToRemote': isSyncedToRemote,
       'deliverySummary': deliverySummary,
+      'locationSource': locationSource,
+      'locationAgeSeconds': locationAgeSeconds,
+      'locationCapturedAt': locationCapturedAt?.toIso8601String(),
+      'recipientResults': recipientResults,
     };
   }
 
@@ -144,6 +164,14 @@ class Incident {
       isSyncedToRemote: map['isSyncedToRemote'] ?? false,
       deliverySummary: map['deliverySummary'] is Map
           ? Map<String, dynamic>.from(map['deliverySummary'] as Map)
+          : null,
+      locationSource: map['locationSource'] as String?,
+      locationAgeSeconds: (map['locationAgeSeconds'] as num?)?.toInt(),
+      locationCapturedAt: map['locationCapturedAt'] != null
+          ? DateTime.tryParse(map['locationCapturedAt'].toString())
+          : null,
+      recipientResults: map['recipientResults'] is List
+          ? map['recipientResults'] as List
           : null,
     );
   }

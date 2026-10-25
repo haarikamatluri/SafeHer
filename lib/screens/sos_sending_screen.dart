@@ -17,54 +17,30 @@ class _SosSendingScreenState extends State<SosSendingScreen>
     with SingleTickerProviderStateMixin {
   late AnimationController _pulseController;
   int _activeStep = 0;
-
-  // 3-second cancellation countdown to prevent accidental activation
-  bool _isCountingDown = true;
-  int _countdownSeconds = 3;
-  Timer? _countdownTimer;
   bool _isCancelled = false;
+  String _currentStatusMessage = 'Activating emergency SOS sequence...';
 
   @override
   void initState() {
     super.initState();
     _pulseController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 1600),
+      duration: const Duration(milliseconds: 1400),
     )..repeat();
 
-    _startCancellationCountdown();
+    _runRealSosSequence();
   }
 
   @override
   void dispose() {
-    _countdownTimer?.cancel();
     _pulseController.dispose();
     super.dispose();
   }
 
-  void _startCancellationCountdown() {
-    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (_countdownSeconds > 1) {
-        setState(() {
-          _countdownSeconds--;
-        });
-      } else {
-        timer.cancel();
-        if (!_isCancelled && mounted) {
-          setState(() {
-            _isCountingDown = false;
-          });
-          _runRealSosSequence();
-        }
-      }
-    });
-  }
-
-  void _cancelSos() async {
+  Future<void> _cancelSos() async {
     _isCancelled = true;
-    _countdownTimer?.cancel();
 
-    // If an incident was already created, mark it cancelled in local and Firestore
+    // If an incident was already created, cancel it safely
     final activeInc = IncidentService().activeIncident;
     if (activeInc != null) {
       await IncidentService().cancelIncident(activeInc.id);
@@ -73,7 +49,7 @@ class _SosSendingScreenState extends State<SosSendingScreen>
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('SOS activation cancelled. No alert was sent.'),
+          content: Text('SOS activation cancelled. Incident was marked false alarm.'),
           backgroundColor: SafeHerColors.warningAmber,
         ),
       );
@@ -88,12 +64,22 @@ class _SosSendingScreenState extends State<SosSendingScreen>
   Future<void> _runRealSosSequence() async {
     if (_isCancelled) return;
 
-    // Step 0: Real GPS Location Acquisition
-    setState(() => _activeStep = 0);
-
-    // Step 1: Real Incident Creation (Local + Firestore) & Alert Dispatch
     try {
-      setState(() => _activeStep = 1);
+      if (mounted) {
+        setState(() {
+          _activeStep = 0;
+          _currentStatusMessage = 'Acquiring GPS fix and checking cached coordinates...';
+        });
+      }
+
+      // Step 1: Trigger non-blocking SOS workflow
+      if (mounted) {
+        setState(() {
+          _activeStep = 1;
+          _currentStatusMessage = 'Initializing local incident and preparing emergency dispatch...';
+        });
+      }
+
       final incident = await IncidentService().triggerSos(
         source: 'sos_button',
         requestLocation: true,
@@ -101,18 +87,22 @@ class _SosSendingScreenState extends State<SosSendingScreen>
 
       if (_isCancelled || !mounted) return;
 
-      setState(() => _activeStep = 2);
-      await Future.delayed(const Duration(milliseconds: 500));
+      // Step 2: SMS dispatch initiated
+      setState(() {
+        _activeStep = 2;
+        _currentStatusMessage = 'Emergency SMS submitted to cellular radio modem...';
+      });
 
-      if (_isCancelled || !mounted) return;
-      setState(() => _activeStep = 3);
-      await Future.delayed(const Duration(milliseconds: 500));
+      // Step 3: Background tracking started
+      setState(() {
+        _activeStep = 3;
+        _currentStatusMessage = 'Live location tracking active. Transitioning to status...';
+      });
 
-      if (_isCancelled || !mounted) return;
-      debugPrint('[SosSendingScreen] SOS flow completed: ${incident.shortId}');
+      debugPrint('[SosSendingScreen] SOS sequence completed: ${incident.shortId}');
       Navigator.pushReplacementNamed(context, AppRoutes.sosSent);
     } catch (e) {
-      debugPrint('[SosSendingScreen] SOS flow exception: $e');
+      debugPrint('[SosSendingScreen] SOS sequence error: $e');
       if (mounted && !_isCancelled) {
         Navigator.pushReplacementNamed(context, AppRoutes.sosSent);
       }
@@ -135,11 +125,9 @@ class _SosSendingScreenState extends State<SosSendingScreen>
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
                 // Heading
-                Text(
-                  _isCountingDown
-                      ? 'Cancelling in $_countdownSeconds...'
-                      : 'Sending Emergency SOS...',
-                  style: const TextStyle(
+                const Text(
+                  'Activating Emergency SOS...',
+                  style: TextStyle(
                     color: Colors.white,
                     fontSize: 24,
                     fontWeight: FontWeight.w800,
@@ -147,14 +135,14 @@ class _SosSendingScreenState extends State<SosSendingScreen>
                   ),
                 ),
 
-                // Centerpiece: Concentric Pulsing Rings & Paper Airplane Icon / Countdown Core
+                // Centerpiece: Concentric Pulsing Rings & Airplane Icon
                 SizedBox(
                   width: 220,
                   height: 220,
                   child: Stack(
                     alignment: Alignment.center,
                     children: [
-                      // Animated pulse ring 1
+                      // Animated pulse ring
                       AnimatedBuilder(
                         animation: _pulseController,
                         builder: (context, child) {
@@ -163,15 +151,9 @@ class _SosSendingScreenState extends State<SosSendingScreen>
                             height: 130 + (_pulseController.value * 80),
                             decoration: BoxDecoration(
                               shape: BoxShape.circle,
-                              color:
-                                  (_isCountingDown
-                                          ? SafeHerColors.warningAmber
-                                          : SafeHerColors.primaryRose)
-                                      .withValues(
-                                        alpha:
-                                            (1.0 - _pulseController.value) *
-                                            0.2,
-                                      ),
+                              color: SafeHerColors.primaryRose.withValues(
+                                alpha: (1.0 - _pulseController.value) * 0.25,
+                              ),
                             ),
                           );
                         },
@@ -185,57 +167,33 @@ class _SosSendingScreenState extends State<SosSendingScreen>
                           shape: BoxShape.circle,
                           color: Colors.white.withValues(alpha: 0.05),
                           border: Border.all(
-                            color:
-                                (_isCountingDown
-                                        ? SafeHerColors.warningAmber
-                                        : SafeHerColors.primaryRose)
-                                    .withValues(alpha: 0.3),
+                            color: SafeHerColors.primaryRose.withValues(alpha: 0.3),
                             width: 2,
                           ),
                         ),
                       ),
 
-                      // Central Badge with Send Icon or Countdown Number
+                      // Central Badge with Send Icon
                       Container(
                         width: 86,
                         height: 86,
                         decoration: BoxDecoration(
-                          gradient: _isCountingDown
-                              ? const LinearGradient(
-                                  colors: [
-                                    Color(0xFFFFA726),
-                                    Color(0xFFFF7043),
-                                  ],
-                                )
-                              : SafeHerColors.pinkButtonGradient,
+                          gradient: SafeHerColors.pinkButtonGradient,
                           shape: BoxShape.circle,
                           boxShadow: [
                             BoxShadow(
-                              color:
-                                  (_isCountingDown
-                                          ? SafeHerColors.warningAmber
-                                          : SafeHerColors.primaryRose)
-                                      .withValues(alpha: 0.5),
+                              color: SafeHerColors.primaryRose.withValues(alpha: 0.5),
                               blurRadius: 20,
                               spreadRadius: 3,
                             ),
                           ],
                         ),
-                        child: Center(
-                          child: _isCountingDown
-                              ? Text(
-                                  '$_countdownSeconds',
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 38,
-                                    fontWeight: FontWeight.w900,
-                                  ),
-                                )
-                              : const Icon(
-                                  Icons.near_me_rounded,
-                                  color: Colors.white,
-                                  size: 40,
-                                ),
+                        child: const Center(
+                          child: Icon(
+                            Icons.near_me_rounded,
+                            color: Colors.white,
+                            size: 40,
+                          ),
                         ),
                       ),
                     ],
@@ -244,9 +202,7 @@ class _SosSendingScreenState extends State<SosSendingScreen>
 
                 // Subtitle
                 Text(
-                  _isCountingDown
-                      ? 'Accidental trigger? Tap Cancel below before alert dispatches.'
-                      : 'Acquiring GPS location and invoking server-side dispatch to trusted contacts.',
+                  _currentStatusMessage,
                   textAlign: TextAlign.center,
                   style: const TextStyle(
                     color: Color(0xFFC4B8CC),
@@ -255,7 +211,7 @@ class _SosSendingScreenState extends State<SosSendingScreen>
                   ),
                 ),
 
-                // Progress Checklist Card matching Screen 9
+                // Progress Checklist Card
                 Container(
                   width: double.infinity,
                   padding: const EdgeInsets.symmetric(
@@ -270,27 +226,27 @@ class _SosSendingScreenState extends State<SosSendingScreen>
                   child: Column(
                     children: [
                       _buildChecklistItem(
-                        title: 'Acquiring GPS location',
-                        isDone: !_isCountingDown && _activeStep >= 1,
-                        isCurrent: !_isCountingDown && _activeStep == 0,
+                        title: 'Acquiring GPS location fix',
+                        isDone: _activeStep >= 1,
+                        isCurrent: _activeStep == 0,
                       ),
                       const SizedBox(height: 14),
                       _buildChecklistItem(
                         title: 'Creating incident record',
-                        isDone: !_isCountingDown && _activeStep >= 2,
-                        isCurrent: !_isCountingDown && _activeStep == 1,
+                        isDone: _activeStep >= 2,
+                        isCurrent: _activeStep == 1,
                       ),
                       const SizedBox(height: 14),
                       _buildChecklistItem(
-                        title: 'Invoking Cloud Function dispatch',
-                        isDone: !_isCountingDown && _activeStep >= 3,
-                        isCurrent: !_isCountingDown && _activeStep == 2,
+                        title: 'Dispatching emergency SMS via SIM',
+                        isDone: _activeStep >= 3,
+                        isCurrent: _activeStep == 2,
                       ),
                       const SizedBox(height: 14),
                       _buildChecklistItem(
-                        title: 'Waiting for provider acknowledgments...',
-                        isDone: false,
-                        isCurrent: !_isCountingDown && _activeStep == 3,
+                        title: 'Starting continuous live tracking',
+                        isDone: _activeStep >= 4,
+                        isCurrent: _activeStep == 3,
                       ),
                     ],
                   ),
@@ -303,11 +259,9 @@ class _SosSendingScreenState extends State<SosSendingScreen>
                   child: OutlinedButton.icon(
                     onPressed: _cancelSos,
                     icon: const Icon(Icons.close_rounded, color: Colors.white),
-                    label: Text(
-                      _isCountingDown
-                          ? 'CANCEL SOS NOW ($_countdownSeconds)'
-                          : 'CANCEL EMERGENCY ALERT',
-                      style: const TextStyle(
+                    label: const Text(
+                      'CANCEL EMERGENCY ALERT',
+                      style: TextStyle(
                         color: Colors.white,
                         fontSize: 15,
                         fontWeight: FontWeight.w700,

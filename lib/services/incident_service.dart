@@ -11,6 +11,7 @@ import '../utils/constants.dart';
 import 'alert_service.dart';
 import 'auth_service.dart';
 import 'contact_service.dart';
+import 'diagnostic_logger.dart';
 import 'live_tracking_service.dart';
 import 'location_service.dart';
 
@@ -65,10 +66,8 @@ class IncidentService {
         _incidents = decoded
             .map((e) => Incident.fromMap(Map<String, dynamic>.from(e)))
             .toList();
-        // Sort descending by creation date
         _incidents.sort((a, b) => b.createdAt.compareTo(a.createdAt));
 
-        // Find active incident if any
         final activeList = _incidents.where((i) => i.status == IncidentStatus.active);
         _activeIncident = activeList.isNotEmpty ? activeList.first : null;
 
@@ -126,11 +125,13 @@ class IncidentService {
     }
   }
 
-  /// Triggers emergency SOS with debounce lock to prevent duplicate activation
+  /// Triggers emergency SOS immediately without blocking SMS on Firestore or long GPS timeouts
   Future<Incident> triggerSos({
     String source = 'sos_button',
     bool requestLocation = true,
   }) async {
+    DiagnosticLogger().logSosTapped(source: source);
+
     // 1. Debounce protection: prevent double execution from rapid taps
     if (_isActivating) {
       throw Exception('SOS activation is already in progress.');
@@ -145,31 +146,13 @@ class IncidentService {
       final incidentId = const Uuid().v4();
       final createdAt = DateTime.now();
 
-      // 2. Fetch location if requested
-      double? lat;
-      double? lng;
-      double? accuracy;
-      if (requestLocation) {
-        final locResult = await LocationService().getCurrentLocation(
-          timeout: const Duration(seconds: 6),
-        );
-        if (locResult.isSuccess) {
-          lat = locResult.latitude;
-          lng = locResult.longitude;
-          accuracy = locResult.accuracy;
-        }
-      }
-
-      // 3. Create incident instance
+      // 2. Initialize local incident instance immediately
       var incident = Incident(
         id: incidentId,
         userId: userId,
         status: IncidentStatus.active,
         source: source,
         createdAt: createdAt,
-        latitude: lat,
-        longitude: lng,
-        locationAccuracy: accuracy,
         locationSharingEnabled: requestLocation,
         alertStatus: AlertDeliveryStatus.preparing,
         alertAttemptCount: 1,
@@ -183,57 +166,39 @@ class IncidentService {
       _incidentsStreamController.add(_incidents);
       await _saveToLocalCache();
 
-      // 4. Save to Firestore if connected
-      bool synced = false;
-      if (!SafeHerAuthService().isUsingFallbackLocalAuth) {
-        try {
-          await FirebaseFirestore.instance
-              .collection(AppConstants.usersCollection)
-              .doc(userId)
-              .collection(AppConstants.incidentsSubcollection)
-              .doc(incidentId)
-              .set(incident.toMap());
-          synced = true;
-        } catch (e) {
-          debugPrint('[IncidentService] Remote Firestore save failed: $e');
+      DiagnosticLogger().logIncidentCreated(
+        incidentId: incidentId,
+        userId: userId,
+        isSynced: false,
+      );
+
+      // 3. Obtain location concurrently with bounded timeout (3-4s max)
+      LocationResult? locResult;
+      if (requestLocation) {
+        locResult = await LocationService().getEmergencyLocation(
+          timeout: const Duration(seconds: 4),
+        );
+
+        if (locResult.isSuccess && locResult.latitude != null && locResult.longitude != null) {
+          incident = incident.copyWith(
+            latitude: locResult.latitude,
+            longitude: locResult.longitude,
+            locationAccuracy: locResult.accuracyMeters,
+            locationSource: locResult.source,
+            locationAgeSeconds: locResult.age?.inSeconds,
+            locationCapturedAt: locResult.capturedAt,
+          );
+        } else {
+          incident = incident.copyWith(
+            locationSource: locResult.source,
+          );
         }
-      }
-
-      if (synced) {
-        incident = incident.copyWith(isSyncedToRemote: true);
         _updateIncidentInMemory(incident);
+        await _saveToLocalCache();
       }
 
-      // 5. Dispatch Alert Pipeline through AlertService
+      // 4. Start Live Location Tracking independently (does not block SMS)
       final contacts = ContactService().contacts;
-      final alertResult = await AlertService().dispatchEmergencyAlert(
-        incident: incident,
-        contacts: contacts,
-      );
-
-      incident = incident.copyWith(
-        alertStatus: alertResult.status,
-        deliverySummary: alertResult.deliverySummary,
-      );
-      _updateIncidentInMemory(incident);
-      await _saveToLocalCache();
-
-      // Update Firestore with final alert status and summary if synced
-      if (synced) {
-        try {
-          await FirebaseFirestore.instance
-              .collection(AppConstants.usersCollection)
-              .doc(userId)
-              .collection(AppConstants.incidentsSubcollection)
-              .doc(incidentId)
-              .update({
-                'alertStatus': incident.alertStatus.value,
-                'deliverySummary': alertResult.deliverySummary,
-              });
-        } catch (_) {}
-      }
-
-      // 6. Start Live Location Tracking Session
       final authorizedContacts = contacts.where((c) => c.isAuthorized).toList();
       unawaited(
         LiveTrackingService().startTracking(
@@ -242,9 +207,123 @@ class IncidentService {
         ),
       );
 
+      // 5. Asynchronous Firestore sync (never blocks SMS dispatch)
+      unawaited(_syncIncidentToFirestore(incident));
+
+      // 6. Dispatch Native SMS alert to authorized contacts immediately
+      final alertResult = await AlertService().dispatchEmergencyAlert(
+        incident: incident,
+        contacts: contacts,
+      );
+
+      // 7. Update incident record with final send results
+      incident = incident.copyWith(
+        alertStatus: alertResult.status,
+        deliverySummary: alertResult.deliverySummary,
+        recipientResults: alertResult.recipientResults,
+      );
+      _updateIncidentInMemory(incident);
+      await _saveToLocalCache();
+
+      // Push final delivery status to Firestore asynchronously
+      unawaited(_syncIncidentToFirestore(incident));
+
       return incident;
+    } catch (e) {
+      DiagnosticLogger().logFailure(
+        stage: 'TRIGGER_SOS',
+        reason: e.toString(),
+      );
+      rethrow;
     } finally {
       _isActivating = false;
+    }
+  }
+
+  /// Retries SMS dispatch for the active incident without creating a duplicate incident
+  Future<AlertDeliveryResult> retryAlertDispatch() async {
+    final active = _activeIncident;
+    if (active == null) {
+      throw Exception('No active incident to retry.');
+    }
+
+    final contacts = ContactService().contacts;
+    final alertResult = await AlertService().dispatchEmergencyAlert(
+      incident: active,
+      contacts: contacts,
+    );
+
+    final updated = active.copyWith(
+      alertStatus: alertResult.status,
+      alertAttemptCount: active.alertAttemptCount + 1,
+      deliverySummary: alertResult.deliverySummary,
+      recipientResults: alertResult.recipientResults,
+    );
+
+    _updateIncidentInMemory(updated);
+    await _saveToLocalCache();
+    unawaited(_syncIncidentToFirestore(updated));
+
+    return alertResult;
+  }
+
+  /// Updates incident location when a newer fresh GPS fix arrives during active SOS
+  void updateActiveLocation({
+    required double latitude,
+    required double longitude,
+    double? accuracyMeters,
+  }) {
+    final active = _activeIncident;
+    if (active == null) return;
+
+    final updated = active.copyWith(
+      latitude: latitude,
+      longitude: longitude,
+      locationAccuracy: accuracyMeters,
+      locationSource: 'fresh_gps',
+      locationAgeSeconds: 0,
+      locationCapturedAt: DateTime.now(),
+    );
+
+    _updateIncidentInMemory(updated);
+    _saveToLocalCache();
+    unawaited(_syncIncidentToFirestore(updated));
+  }
+
+  /// Synchronizes incident document to Firestore asynchronously
+  Future<void> _syncIncidentToFirestore(Incident incident) async {
+    final userId = SafeHerAuthService().currentUserId;
+    if (userId == null || SafeHerAuthService().isUsingFallbackLocalAuth) {
+      return;
+    }
+
+    try {
+      await FirebaseFirestore.instance
+          .collection(AppConstants.usersCollection)
+          .doc(userId)
+          .collection(AppConstants.incidentsSubcollection)
+          .doc(incident.id)
+          .set(incident.toMap(), SetOptions(merge: true));
+
+      DiagnosticLogger().logFirestoreSynced(
+        collection: 'incidents',
+        docId: incident.id,
+        success: true,
+      );
+
+      if (!incident.isSyncedToRemote) {
+        final synced = incident.copyWith(isSyncedToRemote: true);
+        _updateIncidentInMemory(synced);
+        await _saveToLocalCache();
+      }
+    } catch (e) {
+      debugPrint('[IncidentService] Async Firestore sync error: $e');
+      DiagnosticLogger().logFirestoreSynced(
+        collection: 'incidents',
+        docId: incident.id,
+        success: false,
+        error: e.toString(),
+      );
     }
   }
 

@@ -39,9 +39,17 @@ class AppValidators {
     return null;
   }
 
-  /// Normalizes phone number for duplicate checking
+  /// Normalizes phone number for duplicate checking (strips symbols and +)
   static String normalizePhone(String phone) {
     return phone.replaceAll(RegExp(r'[\s\-\(\)\+]'), '');
+  }
+
+  /// Safely normalizes phone number for SMS dispatch, PRESERVING valid international '+' prefix
+  static String normalizeForSms(String phone) {
+    final trimmed = phone.trim();
+    final hasPlus = trimmed.startsWith('+');
+    final digits = trimmed.replaceAll(RegExp(r'[^\d]'), '');
+    return hasPlus ? '+$digits' : digits;
   }
 
   /// Validates check-in duration in minutes

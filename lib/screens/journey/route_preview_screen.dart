@@ -7,6 +7,7 @@ import '../../app/theme.dart';
 import '../../models/journey.dart';
 import '../../models/safe_haven.dart';
 import '../../services/journey_service.dart';
+import '../../services/location_service.dart';
 import '../../services/routing_service.dart';
 import '../../services/safe_haven_service.dart';
 import '../../widgets/real_map_view.dart';
@@ -76,20 +77,12 @@ class _RoutePreviewScreenState extends State<RoutePreviewScreen> {
     setState(() => _isLoadingRoute = true);
 
     try {
-      // 1. Obtain current GPS origin if available
-      final hasPerm = await Geolocator.checkPermission();
-      if (hasPerm == LocationPermission.always || hasPerm == LocationPermission.whileInUse) {
-        try {
-          final pos = await Geolocator.getCurrentPosition(
-            locationSettings: const LocationSettings(timeLimit: Duration(seconds: 4)),
-          );
-          _origin = LatLng(pos.latitude, pos.longitude);
-        } catch (_) {
-          final last = await Geolocator.getLastKnownPosition();
-          if (last != null) {
-            _origin = LatLng(last.latitude, last.longitude);
-          }
-        }
+      // 1. Obtain current GPS origin promptly with bounded timeout
+      final loc = await LocationService().getEmergencyLocation(
+        timeout: const Duration(seconds: 3),
+      );
+      if (loc.isSuccess && loc.latitude != null && loc.longitude != null) {
+        _origin = LatLng(loc.latitude!, loc.longitude!);
       }
 
       // 2. Fetch real road route from RoutingService

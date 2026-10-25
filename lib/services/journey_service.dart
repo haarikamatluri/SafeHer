@@ -13,6 +13,7 @@ import '../services/live_tracking_service.dart';
 import '../services/native_sms_service.dart';
 import '../services/navigation_intelligence.dart';
 import '../services/safe_haven_service.dart';
+import '../utils/validators.dart';
 
 class JourneyService {
   static final JourneyService _instance = JourneyService._internal();
@@ -77,9 +78,10 @@ class JourneyService {
         : 6;
 
     final nextDue = now.add(Duration(minutes: checkinIntervalMinutes));
+    final journeyId = const Uuid().v4();
 
     final journey = Journey(
-      id: const Uuid().v4(),
+      id: journeyId,
       userId: userId,
       destinationName: destinationName,
       destinationLat: destinationLat,
@@ -107,12 +109,13 @@ class JourneyService {
 
     _journeyNotifier.value = journey;
     await _persistActiveJourney(journey);
-    await _syncToFirestore(journey);
+    unawaited(_syncToFirestore(journey));
 
-    // Start Foreground Service Live Tracking session
+    // Start Foreground Service Live Tracking session using the journey's ID
     try {
       await LiveTrackingService().startSession(
         label: 'Journey to $destinationName',
+        sessionId: journeyId,
         destinationLat: destinationLat,
         destinationLng: destinationLng,
       );
@@ -215,10 +218,31 @@ class JourneyService {
   }
 
   void _resumeTimers(Journey journey) {
+    final now = DateTime.now();
+
     if (journey.status == JourneyStatus.checkinMissed) {
-      _startGracePeriodTimer(journey);
-    } else {
-      _startCheckinCountdown();
+      // Check if wall-clock grace period has already passed
+      final missedAt = journey.missedCheckinAt ?? now;
+      final elapsed = now.difference(missedAt);
+      final remainingGrace = Duration(minutes: journey.gracePeriodMinutes) - elapsed;
+
+      if (remainingGrace.isNegative) {
+        // Grace period already expired while app was sleeping/killed -> escalate immediately!
+        if (!journey.escalationTriggered) {
+          escalateMissedCheckin();
+        }
+      } else {
+        _startGracePeriodTimer(journey, delay: remainingGrace);
+      }
+    } else if (journey.status == JourneyStatus.checkinDue) {
+      _triggerMissedCheckin(journey);
+    } else if (journey.status == JourneyStatus.active) {
+      final nextDue = journey.nextCheckinDueAt;
+      if (nextDue != null && now.isAfter(nextDue)) {
+        _onCheckinDue(journey);
+      } else {
+        _startCheckinCountdown();
+      }
     }
     _startLocationUpdates();
   }
@@ -231,7 +255,7 @@ class JourneyService {
     _journeyNotifier.value = updated;
     _persistActiveJourney(updated);
 
-    // Give 60 seconds prompt before turning into Missed Check-in
+    // Give 45 seconds prompt before turning into Missed Check-in
     Future.delayed(const Duration(seconds: 45), () {
       final nowState = _journeyNotifier.value;
       if (nowState != null && nowState.status == JourneyStatus.checkinDue) {
@@ -250,10 +274,11 @@ class JourneyService {
     _startGracePeriodTimer(updated);
   }
 
-  void _startGracePeriodTimer(Journey current) {
+  void _startGracePeriodTimer(Journey current, {Duration? delay}) {
     _gracePeriodTimer?.cancel();
+    final duration = delay ?? Duration(minutes: current.gracePeriodMinutes);
     _gracePeriodTimer = Timer(
-      Duration(minutes: current.gracePeriodMinutes),
+      duration,
       () {
         final nowState = _journeyNotifier.value;
         if (nowState != null &&
@@ -286,7 +311,7 @@ class JourneyService {
 
     _journeyNotifier.value = updated;
     await _persistActiveJourney(updated);
-    await _syncToFirestore(updated);
+    unawaited(_syncToFirestore(updated));
 
     _startCheckinCountdown();
   }
@@ -308,7 +333,7 @@ class JourneyService {
 
     _journeyNotifier.value = updated;
     await _persistActiveJourney(updated);
-    await _syncToFirestore(updated);
+    unawaited(_syncToFirestore(updated));
 
     _startCheckinCountdown();
   }
@@ -326,7 +351,7 @@ class JourneyService {
     );
     _journeyNotifier.value = updated;
     await _persistActiveJourney(updated);
-    await _syncToFirestore(updated);
+    unawaited(_syncToFirestore(updated));
 
     // Send native SIM SMS alert to authorized contacts
     final mapsUrl = (current.lastKnownLat != null && current.lastKnownLng != null)
@@ -337,16 +362,20 @@ class JourneyService {
         'SAFEHER MISSED CHECK-IN ALERT: I have missed my scheduled safety check-in while traveling to ${current.destinationName}. '
         'My last reported location: $mapsUrl. Please verify my safety.';
 
-    for (final phone in current.notifyContactPhones) {
-      if (phone.trim().isNotEmpty) {
-        try {
-          await _smsService.sendDirectSms(
-            phoneNumber: phone.trim(),
-            message: message,
-          );
-        } catch (e) {
-          debugPrint('Escalation SMS error for $phone: $e');
-        }
+    final phones = current.notifyContactPhones
+        .map((p) => AppValidators.normalizeForSms(p))
+        .where((p) => p.isNotEmpty)
+        .toList();
+
+    for (final phone in phones) {
+      try {
+        await _smsService.sendDirectSms(
+          phoneNumber: phone,
+          message: message,
+          incidentId: current.id,
+        );
+      } catch (e) {
+        debugPrint('Escalation SMS error for $phone: $e');
       }
     }
 
@@ -375,7 +404,7 @@ class JourneyService {
     _journeyNotifier.value = null;
     await _saveToHistory(completed);
     await _clearActiveJourney();
-    await _syncToFirestore(completed);
+    unawaited(_syncToFirestore(completed));
 
     return completed;
   }
@@ -391,7 +420,7 @@ class JourneyService {
       );
       await _saveToHistory(cancelled);
       await _clearActiveJourney();
-      await _syncToFirestore(cancelled);
+      unawaited(_syncToFirestore(cancelled));
     }
     _journeyNotifier.value = null;
   }
