@@ -446,16 +446,3 @@ Follow this 3-minute walkthrough to experience SafeHer's complete feature suite:
    - Open **Safe Havens** to view nearest 24/7 pharmacies and police stations with dynamic distance and compass bearing indicators.
    - Tap **Route to Safe Place** to see the direct escape path.
 
----
-
-## 11. Author & Contact
-
-**SafeHer Platform** is designed and maintained by:
-
-- **Author**: Haarikamatluri
-- **Email**: [haarikamatluri@gmail.com](mailto:haarikamatluri@gmail.com)
-- **Repository**: [https://github.com/haarikamatluri/SafeHer](https://github.com/haarikamatluri/SafeHer)
-
----
-
-*SafeHer — Built with care, precision, and an unwavering commitment to women's safety.*
